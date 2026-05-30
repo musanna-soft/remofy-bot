@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -188,35 +189,50 @@ func (s *Session) RunClaude(prompt string, threadID int) {
 		claudeArgs = append(claudeArgs, "--resume", sessionID)
 	}
 
-	// Claude'ni PowerShell orqali wrap qilamiz — Windows'da Go'ning to'g'ridan-to'g'ri
-	// exec'i bilan claude.exe'ga OAuth/keychain handle to'liq pass bo'lmas ekan.
-	// Temp faylni UTF-8 sifatida o'qib, claude.exe stdin'iga pipe qilamiz.
-	// $OutputEncoding/[Console]::*Encoding'ni UTF-8'ga majburlaymiz — aks holda
-	// Win-PS 5.1 default ASCII'da pipe qilib, Cyrillic/emoji '?'ga aylanadi.
-	parts := make([]string, 0, len(claudeArgs)+5)
-	parts = append(parts,
-		"$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();",
-		"[System.IO.File]::ReadAllText("+psQuote(tmpPath)+",[System.Text.Encoding]::UTF8)",
-		"|", "&", psQuote(binary))
-	for _, a := range claudeArgs {
-		parts = append(parts, psQuote(a))
-	}
-	psCmd := strings.Join(parts, " ")
-
-	cmd := exec.CommandContext(ctx, "powershell.exe",
-		"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
-	cmd.Dir = workdir
-	// Windows'da context cancel default holatda faqat PowerShell processni
-	// `TerminateProcess` qiladi, lekin uning farzand `claude.exe` ni qoldiradi —
-	// orphan bo'lib token sarflashda davom etadi. `taskkill /F /T` butun process
-	// daraxtini (PowerShell + claude.exe + uning child'lari) o'ldiradi.
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
+	// Platform-specific exec: Windows'da `claude.exe`'ga OAuth/keychain handle
+	// to'g'ridan-to'g'ri Go exec'i bilan o'tmas ekan — PowerShell orqali wrap
+	// qilamiz va prompt'ni ReadAllText bilan UTF-8'da stdin'ga pipe qilamiz.
+	// Linux/macOS'da bunday muammo yo'q — to'g'ridan-to'g'ri exec qilamiz,
+	// prompt faylini stdin sifatida ochib beramiz.
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		// $OutputEncoding/[Console]::*Encoding'ni UTF-8'ga majburlaymiz — aks
+		// holda Win-PS 5.1 default ASCII'da pipe qilib, Cyrillic/emoji '?'ga
+		// aylanadi.
+		parts := make([]string, 0, len(claudeArgs)+5)
+		parts = append(parts,
+			"$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();",
+			"[System.IO.File]::ReadAllText("+psQuote(tmpPath)+",[System.Text.Encoding]::UTF8)",
+			"|", "&", psQuote(binary))
+		for _, a := range claudeArgs {
+			parts = append(parts, psQuote(a))
 		}
-		return exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		psCmd := strings.Join(parts, " ")
+		cmd = exec.CommandContext(ctx, "powershell.exe",
+			"-NoProfile", "-NoLogo", "-NonInteractive", "-Command", psCmd)
+		cmd.Dir = workdir
+		// Default context cancel faqat PowerShell processni `TerminateProcess`
+		// qiladi, lekin uning farzand `claude.exe` ni qoldiradi — orphan bo'lib
+		// token sarflashda davom etadi. `taskkill /F /T` butun process daraxtini
+		// (PowerShell + claude.exe + uning child'lari) o'ldiradi.
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return os.ErrProcessDone
+			}
+			return exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		}
+	} else {
+		cmd = exec.CommandContext(ctx, binary, claudeArgs...)
+		cmd.Dir = workdir
+		f, err := os.Open(tmpPath)
+		if err != nil {
+			s.editClaudeText(sent.MessageID, "⚠️ Prompt fayl ochish xato: "+err.Error(), true)
+			return
+		}
+		defer f.Close()
+		cmd.Stdin = f
 	}
-	// Cancel'dan keyin Wait'ni cheksiz kutmaymiz — agar taskkill biror sababga
+	// Cancel'dan keyin Wait'ni cheksiz kutmaymiz — agar kill biror sababga
 	// ko'ra ishlamasa, 5 sek dan keyin Go o'zi forceful kill qiladi.
 	cmd.WaitDelay = 5 * time.Second
 
